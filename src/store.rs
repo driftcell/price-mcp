@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use sqlx::sqlite::SqlitePool;
-use sqlx::{QueryBuilder, Row, Sqlite};
+use worker::d1::D1Database;
 
+use crate::db::{DbRow, QueryBuilder, Row, query};
 use crate::models::{
     CodeView, ColorResultGroup, ColorSummary, DocumentView, GetQuoteDataRequest,
     GetQuoteDataResponse, ListPriceBooksRequest, ListPriceBooksResponse, PriceBookSummary,
@@ -15,7 +16,7 @@ use crate::models::{
 
 #[derive(Clone)]
 pub struct PriceBookStore {
-    pool: SqlitePool,
+    database: Arc<D1Database>,
 }
 
 struct ProductBase {
@@ -30,12 +31,12 @@ struct ProductBase {
 }
 
 impl PriceBookStore {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(database: Arc<D1Database>) -> Self {
+        Self { database }
     }
 
-    pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
+    pub(crate) fn write_batch(&self) -> crate::db::WriteBatch {
+        crate::db::WriteBatch::new(Arc::clone(&self.database))
     }
 
     pub async fn list_price_books(
@@ -53,7 +54,7 @@ impl PriceBookStore {
              ORDER BY pb.series, pb.product_domain, pb.id"
         };
 
-        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+        let rows = query(sql).fetch_all(&self.database).await?;
         let mut price_books = Vec::with_capacity(rows.len());
         for row in rows {
             price_books.push(price_book_from_row(&row)?);
@@ -115,7 +116,7 @@ impl PriceBookStore {
             let limit = query.limit.unwrap_or(8).clamp(1, 20);
             let pattern = format!("%{text}%");
             let text_upper = text.to_uppercase();
-            let rows = sqlx::query(
+            let rows = crate::db::query(
                 "SELECT c.id, c.code, c.name, c.color_class, c.material, c.status, \
                         json(c.properties) AS properties_json, \
                         COALESCE((SELECT group_concat(ca.alias, '||') FROM color_aliases ca \
@@ -129,7 +130,7 @@ impl PriceBookStore {
             .bind(&pattern)
             .bind(&pattern)
             .bind(&pattern)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.database)
             .await?;
 
             let mut matches = rows
@@ -170,7 +171,7 @@ impl PriceBookStore {
     async fn search_one(&self, query: &SearchQuery) -> Result<Vec<ProductSummary>> {
         let limit = query.limit.unwrap_or(8).clamp(1, 25);
         let fetch_limit = (limit * 10).clamp(limit, 250);
-        let mut qb = QueryBuilder::<Sqlite>::new(
+        let mut qb = QueryBuilder::new(
             "SELECT p.id, p.name, c.code AS category_code, c.name AS category_name, \
                     p.product_type, p.status, \
                     COALESCE( \
@@ -262,7 +263,11 @@ impl PriceBookStore {
 
         qb.push(" ORDER BY p.name LIMIT ")
             .push_bind(fetch_limit as i64);
-        let rows = qb.build().fetch_all(&self.pool).await?;
+        let statement = qb.build();
+        if statement.binding_count() > 100 {
+            bail!("one product search exceeds D1's 100 bound-parameter limit");
+        }
+        let rows = statement.fetch_all(&self.database).await?;
 
         let text_upper = query
             .text
@@ -317,12 +322,12 @@ impl PriceBookStore {
     }
 
     async fn sample_variants(&self, product_id: i64) -> Result<Vec<VariantSummary>> {
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT id, variant_key, label, json(properties) AS properties_json \
              FROM product_variants WHERE product_id = ? ORDER BY id LIMIT 3",
         )
         .bind(product_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         rows.into_iter()
@@ -478,12 +483,12 @@ impl PriceBookStore {
         let (product_id, candidates) = match (selection.product_id, selection.code) {
             (Some(id), None) => (Some(id), Vec::new()),
             (None, Some(code)) if !code.trim().is_empty() => {
-                let rows = sqlx::query(
+                let rows = query(
                     "SELECT DISTINCT product_id FROM product_codes \
                      WHERE code = ? COLLATE NOCASE ORDER BY product_id",
                 )
                 .bind(code.trim())
-                .fetch_all(&self.pool)
+                .fetch_all(&self.database)
                 .await?;
                 let ids: Vec<i64> = rows.into_iter().map(|row| row.get("product_id")).collect();
                 match ids.as_slice() {
@@ -557,7 +562,7 @@ impl PriceBookStore {
     }
 
     async fn active_price_book(&self, series: &str, domain: &str) -> Result<PriceBookSummary> {
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT pb.*, (SELECT COUNT(*) FROM prices p WHERE p.price_book_id = pb.id) AS price_count \
              FROM price_books pb \
              WHERE pb.status = 'active' AND pb.series = ? AND pb.product_domain = ? \
@@ -565,7 +570,7 @@ impl PriceBookStore {
         )
         .bind(series)
         .bind(domain)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         match rows.len() {
@@ -582,12 +587,12 @@ impl PriceBookStore {
     }
 
     async fn product_category_id(&self, product_id: i64) -> Result<i64> {
-        let query = sqlx::query("SELECT category_id FROM products WHERE id = ?").bind(product_id);
-        Ok(query.fetch_one(&self.pool).await?.get("category_id"))
+        let query = query("SELECT category_id FROM products WHERE id = ?").bind(product_id);
+        Ok(query.fetch_one(&self.database).await?.get("category_id"))
     }
 
     async fn product_summary(&self, product_id: i64) -> Result<ProductSummary> {
-        let row = sqlx::query(
+        let row = query(
             "SELECT p.id, p.name, c.code AS category_code, c.name AS category_name, \
                     p.product_type, p.status, \
                     COALESCE( \
@@ -604,7 +609,7 @@ impl PriceBookStore {
              WHERE p.id = ?",
         )
         .bind(product_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.database)
         .await?;
 
         Ok(ProductSummary {
@@ -629,14 +634,14 @@ impl PriceBookStore {
         max_variants: usize,
         filters: &HashMap<String, Value>,
     ) -> Result<ProductDetail> {
-        let row = sqlx::query(
+        let row = query(
             "SELECT p.id, p.name, p.description, p.category_id, \
                     c.code AS category_code, c.name AS category_name, \
                     p.product_type, p.status, json(p.properties) AS properties_json \
              FROM products p JOIN categories c ON c.id = p.category_id WHERE p.id = ?",
         )
         .bind(product_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.database)
         .await?
         .with_context(|| format!("product {product_id} was not found"))?;
 
@@ -651,20 +656,20 @@ impl PriceBookStore {
             properties: parse_json(row.get("properties_json"))?,
         };
 
-        let scale_rows = sqlx::query(
+        let scale_rows = query(
             "SELECT group_concat(DISTINCT series) AS series FROM product_scopes WHERE product_id = ?",
         )
         .bind(product_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.database)
         .await?;
         let series = split_codes(scale_rows.get::<Option<String>, _>("series"));
 
-        let code_rows = sqlx::query(
+        let code_rows = query(
             "SELECT code, code_type, variant_id, is_primary, json(conditions) AS conditions_json, notes \
              FROM product_codes WHERE product_id = ? ORDER BY is_primary DESC, id",
         )
         .bind(product_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
         let codes = code_rows
             .into_iter()
@@ -680,7 +685,7 @@ impl PriceBookStore {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let price_rows = sqlx::query(
+        let price_rows = query(
             "SELECT pr.id, pr.variant_id, pr.price_kind, pr.amount_decimal, pr.currency, \
                     pr.unit, pr.unit_label, pr.measurement_basis, pr.pricing_mode, \
                     json(pr.conditions) AS conditions_json, pr.derivation_rule_id, pr.notes, \
@@ -691,7 +696,7 @@ impl PriceBookStore {
         )
         .bind(product_id)
         .bind(price_book.id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
         let mut prices_by_variant: HashMap<i64, Vec<PriceView>> = HashMap::new();
         for row in price_rows {
@@ -716,13 +721,13 @@ impl PriceBookStore {
                 });
         }
 
-        let variant_rows = sqlx::query(
+        let variant_rows = query(
             "SELECT id, variant_key, label, status, json(properties) AS properties_json, \
                     json(constraints) AS constraints_json \
              FROM product_variants WHERE product_id = ? ORDER BY id",
         )
         .bind(product_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         let mut matched_variants = Vec::new();
@@ -774,7 +779,7 @@ impl PriceBookStore {
             return Ok(Vec::new());
         }
 
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT r.id, r.relation_type, r.parent_product_id, pp.name AS parent_name, \
                     (SELECT group_concat(DISTINCT pc.code) FROM product_codes pc \
                      WHERE pc.product_id = r.parent_product_id) AS parent_codes, \
@@ -789,7 +794,7 @@ impl PriceBookStore {
              WHERE r.price_book_id = ? ORDER BY r.id",
         )
         .bind(price_book_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         rows.into_iter()
@@ -827,7 +832,7 @@ impl PriceBookStore {
         category_ids: &HashSet<i64>,
         derivation_rule_ids: &HashSet<i64>,
     ) -> Result<Vec<PricingRuleView>> {
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT pr.id, COALESCE(pr.product_id, rv.product_id) AS effective_product_id, \
                     pr.category_id, pr.code, pr.name, pr.rule_type, pr.pricing_mode, \
                     json(pr.scope) AS scope_json, json(pr.conditions) AS conditions_json, \
@@ -838,7 +843,7 @@ impl PriceBookStore {
              WHERE pr.price_book_id = ? ORDER BY pr.priority, pr.id",
         )
         .bind(price_book_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         let mut result = Vec::new();
@@ -877,12 +882,12 @@ impl PriceBookStore {
         price_book_id: i64,
         category_ids: &HashSet<i64>,
     ) -> Result<Vec<DocumentView>> {
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT id, category_id, doc_type, title, content, json(data) AS data_json, sort_order \
              FROM documents WHERE price_book_id = ? ORDER BY sort_order, id",
         )
         .bind(price_book_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.database)
         .await?;
 
         rows.into_iter()
@@ -904,7 +909,7 @@ impl PriceBookStore {
     }
 }
 
-fn price_book_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PriceBookSummary> {
+fn price_book_from_row(row: &DbRow) -> Result<PriceBookSummary> {
     Ok(PriceBookSummary {
         id: row.get("id"),
         slug: row.get("slug"),
@@ -946,7 +951,7 @@ fn split_aliases(value: String) -> Vec<String> {
 }
 
 fn parse_json(value: String) -> Result<Value> {
-    serde_json::from_str(&value).context("failed to parse JSON from SQLite")
+    serde_json::from_str(&value).context("failed to parse JSON from D1")
 }
 
 fn color_score(text_upper: &str, code: &str, name: &str, aliases: &[String]) -> i64 {

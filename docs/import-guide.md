@@ -1,7 +1,9 @@
 # PriceBook import guide
 
-This database is the authoritative product and price source. The original Excel
-files are not stored in or referenced from the database.
+This local SQLite database is the authoritative staging source for product and
+price imports. The original Excel files are not stored in or referenced from the
+database. The Worker uses D1; after a reviewed import, run
+`python3 tools/export_d1.py` to convert the JSONB columns and generate D1 SQL.
 
 ## Fixed scope
 
@@ -26,7 +28,7 @@ book.
 Database file:
 
 ```text
-/Users/driftcell/Desktop/PriceBookMCP/data/pricebook.db
+data/pricebook.db (relative to this repository root)
 ```
 
 Use Python through `uv run` so JSONB is supported:

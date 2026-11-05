@@ -1,6 +1,7 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{Json, ServerHandler, tool, tool_handler, tool_router};
+use worker::send::SendFuture;
 
 use crate::models::{
     GetQuoteDataRequest, GetQuoteDataResponse, ListPriceBooksRequest, ListPriceBooksResponse,
@@ -39,8 +40,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<ListPriceBooksRequest>,
     ) -> Result<Json<ListPriceBooksResponse>, String> {
-        self.store
-            .list_price_books(request)
+        SendFuture::new(self.store.list_price_books(request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -53,8 +53,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SearchProductsRequest>,
     ) -> Result<Json<SearchProductsResponse>, String> {
-        self.store
-            .search_products(request)
+        SendFuture::new(self.store.search_products(request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -67,8 +66,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SearchColorsRequest>,
     ) -> Result<Json<SearchColorsResponse>, String> {
-        self.store
-            .search_colors(request)
+        SendFuture::new(self.store.search_colors(request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -81,8 +79,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<GetQuoteDataRequest>,
     ) -> Result<Json<GetQuoteDataResponse>, String> {
-        self.store
-            .get_quote_data(request)
+        SendFuture::new(self.store.get_quote_data(request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -96,7 +93,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SaveProductsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_products(&self.store, request)
+        SendFuture::new(write_store::save_products(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -110,7 +107,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SaveVariantsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_variants(&self.store, request)
+        SendFuture::new(write_store::save_variants(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -124,7 +121,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SaveCodesRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_codes(&self.store, request)
+        SendFuture::new(write_store::save_codes(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -138,7 +135,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SavePricesRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_prices(&self.store, request)
+        SendFuture::new(write_store::save_prices(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -152,7 +149,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SaveRelationsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_relations(&self.store, request)
+        SendFuture::new(write_store::save_relations(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -166,7 +163,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SavePricingRulesRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_pricing_rules(&self.store, request)
+        SendFuture::new(write_store::save_pricing_rules(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -180,7 +177,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<SaveDocumentsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::save_documents(&self.store, request)
+        SendFuture::new(write_store::save_documents(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -194,7 +191,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<DeleteProductsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::delete_products(&self.store, request)
+        SendFuture::new(write_store::delete_products(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))
@@ -208,7 +205,7 @@ impl PriceBookServer {
         &self,
         Parameters(request): Parameters<DeleteRecordsRequest>,
     ) -> Result<Json<WriteResult>, String> {
-        write_store::delete_records(&self.store, request)
+        SendFuture::new(write_store::delete_records(&self.store, request))
             .await
             .map(Json)
             .map_err(|error| format!("{error:#}"))

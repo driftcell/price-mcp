@@ -5,141 +5,91 @@ mod store;
 mod write_models;
 mod write_store;
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::Context;
-use axum::routing::get;
-use axum::{Json, Router};
-use clap::{Parser, ValueEnum};
-use rmcp::ServiceExt;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use axum::body::Body;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
+use axum::{Json, Router, routing::get};
+use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::json;
-use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
+use tower_service::Service;
+use worker::*;
 
 use crate::server::PriceBookServer;
 use crate::store::PriceBookStore;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Transport {
-    /// Serve Streamable HTTP over a TCP socket.
-    Http,
-    /// Serve MCP over stdin/stdout, for clients that launch the process themselves.
-    Stdio,
-}
+// Emscripten links a binary; workers-rs supplies the actual Worker entrypoint.
+fn main() {}
 
-#[derive(Debug, Parser)]
-#[command(version, about = "PriceBook MCP server")]
-struct Args {
-    /// SQLite database path.
-    #[arg(long, default_value = "data/pricebook.db")]
-    db: PathBuf,
+fn router(env: &Env) -> Result<Router> {
+    let store = PriceBookStore::new(Arc::new(env.d1("DB")?));
+    let allowed_hosts = env
+        .var("MCP_ALLOWED_HOSTS")
+        .map(|value| {
+            value
+                .to_string()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|_| vec!["localhost".to_owned(), "127.0.0.1".to_owned()]);
 
-    /// MCP transport to serve.
-    #[arg(long, value_enum, default_value_t = Transport::Http)]
-    transport: Transport,
-
-    /// HTTP bind host (ignored with --transport stdio).
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-
-    /// HTTP bind port (ignored with --transport stdio).
-    #[arg(long, default_value_t = 8787)]
-    port: u16,
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // stdout is the MCP protocol channel in stdio mode, so logs always go to stderr.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rmcp=info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
-    let pool = db::open(&args.db).await?;
-    let store = PriceBookStore::new(pool);
-
-    match args.transport {
-        Transport::Stdio => serve_stdio(store).await,
-        Transport::Http => serve_http(store, &args).await,
-    }
-}
-
-async fn serve_stdio(store: PriceBookStore) -> anyhow::Result<()> {
-    let service = PriceBookServer::new(store)
-        .serve(rmcp::transport::stdio())
-        .await
-        .context("failed to start stdio MCP service")?;
-
-    tracing::info!("pricebook MCP serving over stdio");
-
-    service
-        .waiting()
-        .await
-        .context("stdio MCP service stopped unexpectedly")?;
-    Ok(())
-}
-
-async fn serve_http(store: PriceBookStore, args: &Args) -> anyhow::Result<()> {
-    let service: StreamableHttpService<PriceBookServer, LocalSessionManager> =
+    let service: StreamableHttpService<PriceBookServer, NeverSessionManager> =
         StreamableHttpService::new(
             {
                 let store = store.clone();
                 move || Ok(PriceBookServer::new(store.clone()))
             },
-            Default::default(),
-            StreamableHttpServerConfig::default(),
+            Arc::new(NeverSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(true)
+                .with_sse_keep_alive(None)
+                .with_sse_retry(None)
+                .with_allowed_hosts(allowed_hosts),
         );
 
-    let app = Router::new()
+    Ok(Router::new()
         .route("/health", get(health))
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service))
+}
 
-    let listener = TcpListener::bind((args.host.as_str(), args.port))
-        .await
-        .with_context(|| format!("failed to bind {}:{}", args.host, args.port))?;
-    let address = listener.local_addr()?;
+#[cfg_attr(target_arch = "wasm32", event(fetch))]
+async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<axum::http::Response<Body>> {
+    if req.uri().path().starts_with("/mcp") && !is_authorized(&req, &env)? {
+        return Ok(unauthorized());
+    }
+    Ok(router(&env)?.call(req).await?)
+}
 
-    tracing::info!(
-        database = %args.db.display(),
-        %address,
-        "pricebook MCP listening at http://{address}/mcp"
-    );
+fn is_authorized(req: &HttpRequest, env: &Env) -> Result<bool> {
+    let token = env.secret("MCP_BEARER_TOKEN")?.to_string();
+    let expected = format!("Bearer {token}");
+    Ok(req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected))
+}
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+fn unauthorized() -> Response<Body> {
+    let mut response = Response::new(Body::from("missing or invalid bearer token"));
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok", "service": "pricebook-mcp" }))
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
+    Json(json!({
+        "status": "ok",
+        "service": "pricebook-mcp",
+        "database": "d1",
+        "transport": "streamable-http"
+    }))
 }

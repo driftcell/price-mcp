@@ -1,0 +1,16 @@
+name = "pricebook-mcp"
+main = "build/index.js"
+compatibility_date = "2026-11-04"
+compatibility_flags = ["new_module_registry"]
+
+[build]
+command = "cargo install -q --git https://github.com/cloudflare/workers-rs --rev 606f27fd93efc698f575ab7e84c6be66e5535468 worker-build && worker-build --emscripten --release"
+
+[vars]
+MCP_ALLOWED_HOSTS = "localhost,127.0.0.1,pricebook-mcp.driftcell.workers.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "pricebook-mcp-experiment"
+database_id = "0ffca771-1783-43cb-a0ff-d3e99e874565"
+migrations_dir = "migrations"

@@ -1,5 +1,13 @@
 /target/
+/build/
+/node_modules/
+/.wrangler/
+/.cf/
+/.cloudflare/
 /data/*.db-wal
 /data/*.db-shm
+/data/*.d1.sql
+.dev.vars
+.deploy.vars
 .DS_Store
 __pycache__/

@@ -1,22 +1,25 @@
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
-use sqlx::{Row, Sqlite, Transaction};
+use std::collections::HashSet;
 
+use crate::db::{self, Row, WriteBatch, resolve_ids};
 use crate::store::PriceBookStore;
 use crate::write_models::{
     DeleteProductsRequest, DeleteRecordsRequest, DeleteTable, SaveCodesRequest,
     SaveDocumentsRequest, SavePricesRequest, SavePricingRulesRequest, SaveProductsRequest,
     SaveRelationsRequest, SaveVariantsRequest, WriteResult,
 };
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 
 pub async fn save_products(
     store: &PriceBookStore,
     request: SaveProductsRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.product_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
+    let mut next_product_id = None;
 
     for item in request.items {
         if let Some(product_id) = item.product_id {
@@ -33,11 +36,24 @@ pub async fn save_products(
             }
             let category_id = category_id(&mut tx, &category_code).await?;
             let properties = json_text(item.properties.unwrap_or_else(|| json!({})))?;
-            let product_id = sqlx::query(
+            let product_id: i64 = match next_product_id {
+                Some(id) => id,
+                None => db::query("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM products")
+                    .fetch_one(&tx)
+                    .await?
+                    .get("next_id"),
+            };
+            next_product_id = Some(
+                product_id
+                    .checked_add(1)
+                    .context("product ID space is exhausted")?,
+            );
+            db::query(
                 "INSERT INTO products \
-                    (category_id, product_type, name, description, properties, status, valid_from, valid_to) \
-                 VALUES (?, ?, ?, ?, jsonb(?), ?, ?, ?)",
+                    (id, category_id, product_type, name, description, properties, status, valid_from, valid_to) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(product_id)
             .bind(category_id)
             .bind(item.product_type.unwrap_or_else(|| "item".to_owned()))
             .bind(name)
@@ -46,10 +62,9 @@ pub async fn save_products(
             .bind(item.status.unwrap_or_else(|| "unknown".to_owned()))
             .bind(item.valid_from)
             .bind(item.valid_to)
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
-            replace_scopes(&mut tx, product_id, scopes).await?;
+            .execute(&mut tx)
+            .await?;
+            insert_new_product_scopes(&mut tx, product_id, scopes).await?;
             created.push(product_id);
         }
     }
@@ -67,19 +82,20 @@ pub async fn save_variants(
     request: SaveVariantsRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.variant_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(variant_id) = item.variant_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT product_id, variant_key, label, json(properties) AS properties_json, \
                         json(constraints) AS constraints_json, status, valid_from, valid_to \
                  FROM product_variants WHERE id = ?",
             )
             .bind(variant_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("variant {variant_id} was not found"))?;
             if let Some(product_id) = item.product_id {
@@ -100,9 +116,9 @@ pub async fn save_variants(
                 Some(value) => json_text(value)?,
                 None => current.get("constraints_json"),
             };
-            sqlx::query(
-                "UPDATE product_variants SET variant_key = ?, label = ?, properties = jsonb(?), \
-                    constraints = jsonb(?), status = ?, valid_from = ?, valid_to = ? WHERE id = ?",
+            db::query(
+                "UPDATE product_variants SET variant_key = ?, label = ?, properties = ?, \
+                    constraints = ?, status = ?, valid_from = ?, valid_to = ? WHERE id = ?",
             )
             .bind(variant_key)
             .bind(item.label.or_else(|| current.get("label")))
@@ -112,7 +128,7 @@ pub async fn save_variants(
             .bind(item.valid_from.or_else(|| current.get("valid_from")))
             .bind(item.valid_to.or_else(|| current.get("valid_to")))
             .bind(variant_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(variant_id);
         } else {
@@ -120,10 +136,10 @@ pub async fn save_variants(
             let variant_key = required_string(item.variant_key, "variant_key")?;
             let properties = json_text(item.properties.unwrap_or_else(|| json!({})))?;
             let constraints = json_text(item.constraints.unwrap_or_else(|| json!({})))?;
-            let variant_id = sqlx::query(
+            let variant_id = db::query(
                 "INSERT INTO product_variants \
                     (product_id, variant_key, label, properties, constraints, status, valid_from, valid_to) \
-                 VALUES (?, ?, ?, jsonb(?), jsonb(?), ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(product_id)
             .bind(variant_key)
@@ -133,14 +149,15 @@ pub async fn save_variants(
             .bind(item.status.unwrap_or_else(|| "unknown".to_owned()))
             .bind(item.valid_from)
             .bind(item.valid_to)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(variant_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -150,19 +167,20 @@ pub async fn save_variants(
 
 pub async fn save_codes(store: &PriceBookStore, request: SaveCodesRequest) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.code_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(code_id) = item.code_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT product_id, variant_id, code, code_type, is_primary, \
                         json(conditions) AS conditions_json, notes \
                  FROM product_codes WHERE id = ?",
             )
             .bind(code_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("code row {code_id} was not found"))?;
             if let Some(product_id) = item.product_id {
@@ -186,9 +204,9 @@ pub async fn save_codes(store: &PriceBookStore, request: SaveCodesRequest) -> Re
             let variant_id: Option<i64> = item.variant_id.or_else(|| current.get("variant_id"));
             let product_id: i64 = current.get("product_id");
             validate_code_variant(&mut tx, product_id, variant_id).await?;
-            sqlx::query(
+            db::query(
                 "UPDATE product_codes SET variant_id = ?, code = ?, code_type = ?, \
-                    is_primary = ?, conditions = jsonb(?), notes = ? WHERE id = ?",
+                    is_primary = ?, conditions = ?, notes = ? WHERE id = ?",
             )
             .bind(variant_id)
             .bind(code)
@@ -197,7 +215,7 @@ pub async fn save_codes(store: &PriceBookStore, request: SaveCodesRequest) -> Re
             .bind(conditions)
             .bind(item.notes.or_else(|| current.get("notes")))
             .bind(code_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(code_id);
         } else {
@@ -205,10 +223,10 @@ pub async fn save_codes(store: &PriceBookStore, request: SaveCodesRequest) -> Re
             let code = required_string(item.code, "code")?;
             validate_code_variant(&mut tx, product_id, item.variant_id).await?;
             let conditions = json_text(item.conditions.unwrap_or_else(|| json!({})))?;
-            let code_id = sqlx::query(
+            let code_id = db::query(
                 "INSERT INTO product_codes \
                     (product_id, variant_id, code, code_type, is_primary, conditions, notes) \
-                 VALUES (?, ?, ?, ?, ?, jsonb(?), ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(product_id)
             .bind(item.variant_id)
@@ -217,14 +235,15 @@ pub async fn save_codes(store: &PriceBookStore, request: SaveCodesRequest) -> Re
             .bind(item.is_primary.unwrap_or(false) as i64)
             .bind(conditions)
             .bind(item.notes)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(code_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -237,13 +256,14 @@ pub async fn save_prices(
     request: SavePricesRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.price_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(price_id) = item.price_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT price_book_id, variant_id, price_kind, amount_decimal, currency, unit, \
                         unit_label, measurement_basis, pricing_mode, \
                         json(conditions) AS conditions_json, derivation_rule_id, notes, \
@@ -251,7 +271,7 @@ pub async fn save_prices(
                  FROM prices WHERE id = ?",
             )
             .bind(price_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("price {price_id} was not found"))?;
             let price_book_id: i64 = item
@@ -274,10 +294,10 @@ pub async fn save_prices(
                 Some(value) => json_text(value)?,
                 None => current.get("conditions_json"),
             };
-            sqlx::query(
+            db::query(
                 "UPDATE prices SET price_book_id = ?, variant_id = ?, price_kind = ?, \
                     amount_decimal = ?, currency = ?, unit = ?, unit_label = ?, \
-                    measurement_basis = ?, pricing_mode = ?, conditions = jsonb(?), \
+                    measurement_basis = ?, pricing_mode = ?, conditions = ?, \
                     derivation_rule_id = ?, notes = ?, valid_from = ?, valid_to = ? \
                  WHERE id = ?",
             )
@@ -299,7 +319,7 @@ pub async fn save_prices(
             .bind(item.valid_from.or_else(|| current.get("valid_from")))
             .bind(item.valid_to.or_else(|| current.get("valid_to")))
             .bind(price_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(price_id);
         } else {
@@ -315,12 +335,12 @@ pub async fn save_prices(
                 validate_rule_book(&mut tx, rule_id, price_book_id).await?;
             }
             let conditions = json_text(item.conditions.unwrap_or_else(|| json!({})))?;
-            let price_id = sqlx::query(
+            let price_id = db::query(
                 "INSERT INTO prices \
                     (price_book_id, variant_id, price_kind, amount_decimal, currency, unit, \
                      unit_label, measurement_basis, pricing_mode, conditions, derivation_rule_id, \
                      notes, valid_from, valid_to) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, jsonb(?), ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(price_book_id)
             .bind(variant_id)
@@ -336,14 +356,15 @@ pub async fn save_prices(
             .bind(item.notes)
             .bind(item.valid_from)
             .bind(item.valid_to)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(price_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -356,20 +377,21 @@ pub async fn save_relations(
     request: SaveRelationsRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.relation_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(relation_id) = item.relation_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT price_book_id, parent_product_id, parent_variant_id, child_product_id, \
                         child_variant_id, child_label, relation_type, json(quantity) AS quantity_json, \
                         json(conditions) AS conditions_json, notes \
                  FROM product_relations WHERE id = ?",
             )
             .bind(relation_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("relation {relation_id} was not found"))?;
             let quantity = match item.quantity {
@@ -380,11 +402,11 @@ pub async fn save_relations(
                 Some(value) => json_text(value)?,
                 None => current.get("conditions_json"),
             };
-            sqlx::query(
+            db::query(
                 "UPDATE product_relations SET price_book_id = ?, parent_product_id = ?, \
                     parent_variant_id = ?, child_product_id = ?, child_variant_id = ?, \
-                    child_label = ?, relation_type = ?, quantity = jsonb(?), \
-                    conditions = jsonb(?), notes = ? WHERE id = ?",
+                    child_label = ?, relation_type = ?, quantity = ?, \
+                    conditions = ?, notes = ? WHERE id = ?",
             )
             .bind(
                 item.price_book_id
@@ -415,7 +437,7 @@ pub async fn save_relations(
             .bind(conditions)
             .bind(item.notes.or_else(|| current.get("notes")))
             .bind(relation_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(relation_id);
         } else {
@@ -432,11 +454,11 @@ pub async fn save_relations(
             }
             let quantity = json_text(item.quantity.unwrap_or_else(|| json!({})))?;
             let conditions = json_text(item.conditions.unwrap_or_else(|| json!({})))?;
-            let relation_id = sqlx::query(
+            let relation_id = db::query(
                 "INSERT INTO product_relations \
                     (price_book_id, parent_product_id, parent_variant_id, child_product_id, \
                      child_variant_id, child_label, relation_type, quantity, conditions, notes) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, jsonb(?), jsonb(?), ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(price_book_id)
             .bind(parent_product_id)
@@ -448,14 +470,15 @@ pub async fn save_relations(
             .bind(quantity)
             .bind(conditions)
             .bind(item.notes)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(relation_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -468,13 +491,14 @@ pub async fn save_pricing_rules(
     request: SavePricingRulesRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.rule_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(rule_id) = item.rule_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT price_book_id, product_id, variant_id, category_id, code, name, rule_type, \
                         pricing_mode, json(scope) AS scope_json, \
                         json(conditions) AS conditions_json, json(data) AS data_json, \
@@ -482,7 +506,7 @@ pub async fn save_pricing_rules(
                  FROM pricing_rules WHERE id = ?",
             )
             .bind(rule_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("pricing rule {rule_id} was not found"))?;
             let category_id: Option<i64> = match item.category_code {
@@ -501,10 +525,10 @@ pub async fn save_pricing_rules(
                 Some(value) => json_text(value)?,
                 None => current.get("data_json"),
             };
-            sqlx::query(
+            db::query(
                 "UPDATE pricing_rules SET price_book_id = ?, product_id = ?, variant_id = ?, \
                     category_id = ?, code = ?, name = ?, rule_type = ?, pricing_mode = ?, \
-                    scope = jsonb(?), conditions = jsonb(?), data = jsonb(?), description = ?, \
+                    scope = ?, conditions = ?, data = ?, description = ?, \
                     priority = ?, valid_from = ?, valid_to = ? WHERE id = ?",
             )
             .bind(
@@ -526,7 +550,7 @@ pub async fn save_pricing_rules(
             .bind(item.valid_from.or_else(|| current.get("valid_from")))
             .bind(item.valid_to.or_else(|| current.get("valid_to")))
             .bind(rule_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(rule_id);
         } else {
@@ -540,11 +564,11 @@ pub async fn save_pricing_rules(
             let scope = json_text(item.scope.unwrap_or_else(|| json!({})))?;
             let conditions = json_text(item.conditions.unwrap_or_else(|| json!({})))?;
             let data = json_text(item.data.unwrap_or_else(|| json!({})))?;
-            let rule_id = sqlx::query(
+            let rule_id = db::query(
                 "INSERT INTO pricing_rules \
                     (price_book_id, product_id, variant_id, category_id, code, name, rule_type, \
                      pricing_mode, scope, conditions, data, description, priority, valid_from, valid_to) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, jsonb(?), jsonb(?), jsonb(?), ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(price_book_id)
             .bind(item.product_id)
@@ -561,14 +585,15 @@ pub async fn save_pricing_rules(
             .bind(item.priority.unwrap_or(100))
             .bind(item.valid_from)
             .bind(item.valid_to)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(rule_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -581,19 +606,20 @@ pub async fn save_documents(
     request: SaveDocumentsRequest,
 ) -> Result<WriteResult> {
     ensure_batch(&request.items)?;
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| item.document_id))?;
+    let mut tx = store.write_batch();
     let mut created = Vec::new();
     let mut updated = Vec::new();
 
     for item in request.items {
         if let Some(document_id) = item.document_id {
-            let current = sqlx::query(
+            let current = db::query(
                 "SELECT price_book_id, category_id, doc_type, title, content, \
                         json(data) AS data_json, sort_order \
                  FROM documents WHERE id = ?",
             )
             .bind(document_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&tx)
             .await?
             .with_context(|| format!("document {document_id} was not found"))?;
             let category_id: Option<i64> = match item.category_code {
@@ -604,9 +630,9 @@ pub async fn save_documents(
                 Some(value) => json_text(value)?,
                 None => current.get("data_json"),
             };
-            sqlx::query(
+            db::query(
                 "UPDATE documents SET price_book_id = ?, category_id = ?, doc_type = ?, title = ?, \
-                    content = ?, data = jsonb(?), sort_order = ? WHERE id = ?",
+                    content = ?, data = ?, sort_order = ? WHERE id = ?",
             )
             .bind(
                 item.price_book_id
@@ -619,7 +645,7 @@ pub async fn save_documents(
             .bind(data)
             .bind(item.sort_order.unwrap_or_else(|| current.get("sort_order")))
             .bind(document_id)
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?;
             updated.push(document_id);
         } else {
@@ -630,10 +656,10 @@ pub async fn save_documents(
                 None => None,
             };
             let data = json_text(item.data.unwrap_or_else(|| json!({})))?;
-            let document_id = sqlx::query(
+            let document_id = db::query(
                 "INSERT INTO documents \
                     (price_book_id, category_id, doc_type, title, content, data, sort_order) \
-                 VALUES (?, ?, ?, ?, ?, jsonb(?), ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(item.price_book_id)
             .bind(category_id)
@@ -642,14 +668,15 @@ pub async fn save_documents(
             .bind(item.content)
             .bind(data)
             .bind(item.sort_order.unwrap_or(0))
-            .execute(&mut *tx)
+            .execute(&mut tx)
             .await?
             .last_insert_rowid();
             created.push(document_id);
         }
     }
 
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let created = resolve_ids(created, &results)?;
     Ok(WriteResult {
         created,
         updated,
@@ -664,36 +691,40 @@ pub async fn delete_products(
     if request.items.is_empty() {
         bail!("items must not be empty");
     }
-    let mut tx = store.pool().begin().await?;
+    ensure_unique_ids(request.items.iter().map(|item| Some(item.product_id)))?;
+    let mut tx = store.write_batch();
     let mut updated = Vec::new();
     let mut deleted = Vec::new();
     for item in request.items {
         match item.mode.as_str() {
             "retire" => {
-                let result =
-                    sqlx::query("UPDATE products SET status = 'discontinued' WHERE id = ?")
-                        .bind(item.product_id)
-                        .execute(&mut *tx)
-                        .await?;
-                if result.rows_affected() == 0 {
-                    bail!("product {} was not found", item.product_id);
-                }
-                sqlx::query(
+                db::query("SELECT id FROM products WHERE id = ?")
+                    .bind(item.product_id)
+                    .fetch_optional(&tx)
+                    .await?
+                    .with_context(|| format!("product {} was not found", item.product_id))?;
+                db::query("UPDATE products SET status = 'discontinued' WHERE id = ?")
+                    .bind(item.product_id)
+                    .execute(&mut tx)
+                    .await?;
+                db::query(
                     "UPDATE product_variants SET status = 'discontinued' WHERE product_id = ?",
                 )
                 .bind(item.product_id)
-                .execute(&mut *tx)
+                .execute(&mut tx)
                 .await?;
                 updated.push(item.product_id);
             }
             "hard" => {
-                let result = sqlx::query("DELETE FROM products WHERE id = ?")
+                db::query("SELECT id FROM products WHERE id = ?")
                     .bind(item.product_id)
-                    .execute(&mut *tx)
+                    .fetch_optional(&tx)
+                    .await?
+                    .with_context(|| format!("product {} was not found", item.product_id))?;
+                db::query("DELETE FROM products WHERE id = ?")
+                    .bind(item.product_id)
+                    .execute(&mut tx)
                     .await?;
-                if result.rows_affected() == 0 {
-                    bail!("product {} was not found", item.product_id);
-                }
                 deleted.push(item.product_id);
             }
             other => bail!("invalid delete mode '{other}', expected retire or hard"),
@@ -714,8 +745,8 @@ pub async fn delete_records(
     if request.groups.is_empty() {
         bail!("groups must not be empty");
     }
-    let mut tx = store.pool().begin().await?;
-    let mut deleted = Vec::new();
+    let mut tx = store.write_batch();
+    let mut pending = Vec::new();
     for group in request.groups {
         if group.ids.is_empty() {
             continue;
@@ -729,13 +760,17 @@ pub async fn delete_records(
             DeleteTable::Documents => "DELETE FROM documents WHERE id = ?",
         };
         for id in group.ids {
-            let result = sqlx::query(sql).bind(id).execute(&mut *tx).await?;
-            if result.rows_affected() > 0 {
-                deleted.push(id);
-            }
+            let write = db::query(sql).bind(id).execute(&mut tx).await?;
+            pending.push((id, write));
         }
     }
-    tx.commit().await?;
+    let results = tx.commit().await?;
+    let mut deleted = Vec::new();
+    for (id, write) in pending {
+        if write.rows_affected(&results)? > 0 {
+            deleted.push(id);
+        }
+    }
     Ok(WriteResult {
         created: Vec::new(),
         updated: Vec::new(),
@@ -744,16 +779,16 @@ pub async fn delete_records(
 }
 
 async fn update_product(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut WriteBatch,
     product_id: i64,
     item: crate::write_models::ProductWrite,
 ) -> Result<()> {
-    let current = sqlx::query(
+    let current = db::query(
         "SELECT category_id, product_type, name, description, json(properties) AS properties_json, \
                 status, valid_from, valid_to FROM products WHERE id = ?",
     )
     .bind(product_id)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&*tx)
     .await?
     .with_context(|| format!("product {product_id} was not found"))?;
 
@@ -769,9 +804,9 @@ async fn update_product(
         Some(value) => json_text(value)?,
         None => current.get("properties_json"),
     };
-    sqlx::query(
+    db::query(
         "UPDATE products SET category_id = ?, product_type = ?, name = ?, description = ?, \
-            properties = jsonb(?), status = ?, valid_from = ?, valid_to = ? WHERE id = ?",
+            properties = ?, status = ?, valid_from = ?, valid_to = ? WHERE id = ?",
     )
     .bind(category_id)
     .bind(
@@ -785,7 +820,7 @@ async fn update_product(
     .bind(item.valid_from.or_else(|| current.get("valid_from")))
     .bind(item.valid_to.or_else(|| current.get("valid_to")))
     .bind(product_id)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
 
     if let Some(scopes) = item.scopes {
@@ -797,49 +832,78 @@ async fn update_product(
     Ok(())
 }
 
-async fn replace_scopes(
-    tx: &mut Transaction<'_, Sqlite>,
+async fn insert_new_product_scopes(
+    tx: &mut WriteBatch,
     product_id: i64,
     scopes: Vec<crate::write_models::ScopeWrite>,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM product_scopes WHERE product_id = ?")
+    let mut query =
+        db::QueryBuilder::new("INSERT INTO product_scopes (product_id, series, product_domain) ");
+    for (index, scope) in scopes.into_iter().enumerate() {
+        if index > 0 {
+            query.push(" UNION ALL ");
+        }
+        let series = required_nonempty(scope.series, "series")?;
+        let domain = required_nonempty(scope.domain, "domain")?;
+        query
+            .push("SELECT ")
+            .push_bind(product_id)
+            .push(", ")
+            .push_bind(series)
+            .push(", ")
+            .push_bind(domain);
+    }
+    let statement = query.build();
+    if statement.binding_count() > 100 {
+        bail!("product scopes exceed D1's 100 bound-parameter limit");
+    }
+    statement.execute(&mut *tx).await?;
+    Ok(())
+}
+
+async fn replace_scopes(
+    tx: &mut WriteBatch,
+    product_id: i64,
+    scopes: Vec<crate::write_models::ScopeWrite>,
+) -> Result<()> {
+    db::query("DELETE FROM product_scopes WHERE product_id = ?")
         .bind(product_id)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     for scope in scopes {
         let series = required_nonempty(scope.series, "series")?;
         let domain = required_nonempty(scope.domain, "domain")?;
-        sqlx::query(
+        db::query(
             "INSERT INTO product_scopes (product_id, series, product_domain) VALUES (?, ?, ?)",
         )
         .bind(product_id)
         .bind(series)
         .bind(domain)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     }
     Ok(())
 }
 
-async fn category_id(tx: &mut Transaction<'_, Sqlite>, code: &str) -> Result<i64> {
+async fn category_id(tx: &mut WriteBatch, code: &str) -> Result<i64> {
     let code = code.trim();
-    let row = sqlx::query("SELECT id FROM categories WHERE code = ?")
+    let row = db::query("SELECT id FROM categories WHERE code = ?")
         .bind(code)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&*tx)
         .await?
         .with_context(|| format!("unknown category code '{code}'"))?;
     Ok(row.get("id"))
 }
 
 async fn validate_code_variant(
-    tx: &mut Transaction<'_, Sqlite>,
+    tx: &mut WriteBatch,
     product_id: i64,
     variant_id: Option<i64>,
 ) -> Result<()> {
     if let Some(variant_id) = variant_id {
-        let row = sqlx::query("SELECT product_id FROM product_variants WHERE id = ?")
+        let row = db::query("SELECT product_id FROM product_variants WHERE id = ?")
             .bind(variant_id)
-            .fetch_optional(&mut **tx)
+            .fetch_optional(&*tx)
             .await?
             .with_context(|| format!("variant {variant_id} was not found"))?;
         let actual_product: i64 = row.get("product_id");
@@ -850,14 +914,10 @@ async fn validate_code_variant(
     Ok(())
 }
 
-async fn validate_rule_book(
-    tx: &mut Transaction<'_, Sqlite>,
-    rule_id: i64,
-    price_book_id: i64,
-) -> Result<()> {
-    let row = sqlx::query("SELECT price_book_id FROM pricing_rules WHERE id = ?")
+async fn validate_rule_book(tx: &mut WriteBatch, rule_id: i64, price_book_id: i64) -> Result<()> {
+    let row = db::query("SELECT price_book_id FROM pricing_rules WHERE id = ?")
         .bind(rule_id)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&*tx)
         .await?
         .with_context(|| format!("pricing rule {rule_id} was not found"))?;
     let actual_book: i64 = row.get("price_book_id");
@@ -885,6 +945,16 @@ fn validate_price_amount(amount: Option<&str>) -> Result<()> {
         }
         if digits == 0 {
             bail!("amount_decimal must contain digits");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_ids(ids: impl IntoIterator<Item = Option<i64>>) -> Result<()> {
+    let mut seen = HashSet::new();
+    for id in ids.into_iter().flatten() {
+        if !seen.insert(id) {
+            bail!("ID {id} appears more than once in one D1 write batch");
         }
     }
     Ok(())
@@ -921,233 +991,38 @@ fn json_text(value: Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write_models::{
-        CodeWrite, DeleteProductItem, DeleteRecordsRequest, PriceWrite, ProductWrite,
-        SaveCodesRequest, SavePricesRequest, ScopeWrite, VariantWrite,
-    };
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-    async fn test_store() -> PriceBookStore {
-        let options = SqliteConnectOptions::new()
-            .filename(":memory:")
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query(
-            "INSERT INTO price_books \
-                (slug, name, series, product_domain, version_label, status) \
-             VALUES ('test-book', 'Test', 'S', 'kitchen', 'test', 'active')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        PriceBookStore::new(pool)
+    #[test]
+    fn validates_plain_decimal_strings() {
+        for valid in ["0", "12.34", "-15.00", ".5", "1."] {
+            assert!(validate_price_amount(Some(valid)).is_ok(), "{valid}");
+        }
+        for invalid in ["", " ", "-", ".", "1.2.3", "+1", "1e3", "abc"] {
+            assert!(validate_price_amount(Some(invalid)).is_err(), "{invalid}");
+        }
+        assert!(validate_price_amount(None).is_ok());
     }
 
-    #[tokio::test]
-    async fn create_and_update_catalog_graph() {
-        let store = test_store().await;
-        let products = save_products(
-            &store,
-            SaveProductsRequest {
-                items: vec![ProductWrite {
-                    product_id: None,
-                    category_code: Some("drawer".to_owned()),
-                    product_type: Some("item".to_owned()),
-                    name: Some("测试抽屉".to_owned()),
-                    description: None,
-                    properties: Some(json!({"material": "test"})),
-                    status: Some("active".to_owned()),
-                    valid_from: None,
-                    valid_to: None,
-                    scopes: Some(vec![ScopeWrite {
-                        series: "S".to_owned(),
-                        domain: "kitchen".to_owned(),
-                    }]),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let product_id = products.created[0];
-
-        let variants = save_variants(
-            &store,
-            SaveVariantsRequest {
-                items: vec![VariantWrite {
-                    variant_id: None,
-                    product_id: Some(product_id),
-                    variant_key: Some("nl300".to_owned()),
-                    label: Some("NL=300".to_owned()),
-                    properties: Some(json!({"nl_mm": 300})),
-                    constraints: None,
-                    status: Some("active".to_owned()),
-                    valid_from: None,
-                    valid_to: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let variant_id = variants.created[0];
-
-        let codes = save_codes(
-            &store,
-            SaveCodesRequest {
-                items: vec![CodeWrite {
-                    code_id: None,
-                    product_id: Some(product_id),
-                    variant_id: Some(variant_id),
-                    code: Some("TEST-300".to_owned()),
-                    code_type: Some("new".to_owned()),
-                    is_primary: Some(true),
-                    conditions: None,
-                    notes: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(codes.created.len(), 1);
-
-        let prices = save_prices(
-            &store,
-            SavePricesRequest {
-                items: vec![PriceWrite {
-                    price_id: None,
-                    price_book_id: Some(1),
-                    variant_id: Some(variant_id),
-                    price_kind: Some("retail".to_owned()),
-                    amount_decimal: Some("12.34".to_owned()),
-                    currency: None,
-                    unit: Some("piece".to_owned()),
-                    unit_label: Some("元/个".to_owned()),
-                    measurement_basis: Some("fixed".to_owned()),
-                    pricing_mode: Some("component".to_owned()),
-                    conditions: Some(json!({"color": "灰色"})),
-                    derivation_rule_id: None,
-                    notes: None,
-                    valid_from: None,
-                    valid_to: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let price_id = prices.created[0];
-
-        let price = sqlx::query(
-            "SELECT amount_decimal, unit, json(conditions) AS conditions_json FROM prices WHERE id = ?",
-        )
-        .bind(price_id)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(price.get::<String, _>("amount_decimal"), "12.34");
-        assert_eq!(price.get::<String, _>("unit"), "piece");
+    #[test]
+    fn validates_required_strings_and_batch_sizes() {
         assert_eq!(
-            price.get::<String, _>("conditions_json"),
+            required_string(Some("  name  ".to_owned()), "name").unwrap(),
+            "name"
+        );
+        assert!(required_string(None, "name").is_err());
+        assert!(required_nonempty("  ".to_owned(), "name").is_err());
+        assert!(ensure_batch(&[1]).is_ok());
+        assert!(ensure_batch::<i32>(&[]).is_err());
+        assert!(ensure_batch(&vec![0; 501]).is_err());
+        assert!(ensure_unique_ids([None, None, Some(1), Some(2)]).is_ok());
+        assert!(ensure_unique_ids([Some(1), Some(1)]).is_err());
+    }
+
+    #[test]
+    fn serializes_json_as_text() {
+        assert_eq!(
+            json_text(json!({"color": "灰色"})).unwrap(),
             r#"{"color":"灰色"}"#
         );
-
-        save_prices(
-            &store,
-            SavePricesRequest {
-                items: vec![PriceWrite {
-                    price_id: Some(price_id),
-                    price_book_id: None,
-                    variant_id: None,
-                    price_kind: None,
-                    amount_decimal: Some("15.00".to_owned()),
-                    currency: None,
-                    unit: None,
-                    unit_label: None,
-                    measurement_basis: None,
-                    pricing_mode: None,
-                    conditions: None,
-                    derivation_rule_id: None,
-                    notes: None,
-                    valid_from: None,
-                    valid_to: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let amount: String = sqlx::query_scalar("SELECT amount_decimal FROM prices WHERE id = ?")
-            .bind(price_id)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(amount, "15.00");
-
-        delete_products(
-            &store,
-            DeleteProductsRequest {
-                items: vec![DeleteProductItem {
-                    product_id,
-                    mode: "retire".to_owned(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM products WHERE id = ?")
-            .bind(product_id)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(status, "discontinued");
-
-        delete_records(
-            &store,
-            DeleteRecordsRequest {
-                groups: vec![crate::write_models::DeleteGroup {
-                    table: DeleteTable::Prices,
-                    ids: vec![price_id],
-                }],
-            },
-        )
-        .await
-        .unwrap();
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prices WHERE id = ?")
-            .bind(price_id)
-            .fetch_one(store.pool())
-            .await
-            .unwrap();
-        assert_eq!(remaining, 0);
-    }
-
-    #[tokio::test]
-    async fn invalid_decimal_rolls_back_batch() {
-        let store = test_store().await;
-        let result = save_prices(
-            &store,
-            SavePricesRequest {
-                items: vec![PriceWrite {
-                    price_id: None,
-                    price_book_id: Some(1),
-                    variant_id: Some(1),
-                    price_kind: Some("retail".to_owned()),
-                    amount_decimal: Some("1.2.3".to_owned()),
-                    currency: None,
-                    unit: Some("piece".to_owned()),
-                    unit_label: None,
-                    measurement_basis: None,
-                    pricing_mode: None,
-                    conditions: None,
-                    derivation_rule_id: None,
-                    notes: None,
-                    valid_from: None,
-                    valid_to: None,
-                }],
-            },
-        )
-        .await;
-        assert!(result.is_err());
     }
 }

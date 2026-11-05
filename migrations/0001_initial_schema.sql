@@ -1,8 +1,6 @@
--- PriceBook MCP schema v1.
--- JSON columns are stored as SQLite JSONB BLOBs. Importers must insert them
--- with jsonb(?) (or SQLx bind a JSONB byte sequence), never plain JSON text.
-
-PRAGMA foreign_keys = ON;
+-- PriceBook MCP D1 schema v1.
+-- JSON columns are TEXT containing valid JSON. D1 enforces foreign keys by
+-- default; local SQLite JSONB values must be converted to JSON text on export.
 
 CREATE TABLE price_books (
     id              INTEGER PRIMARY KEY,
@@ -62,7 +60,7 @@ CREATE TABLE products (
                  CHECK (product_type IN ('item', 'system', 'bundle', 'service', 'component', 'master_data')),
     name         TEXT NOT NULL,
     description  TEXT,
-    properties   BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(properties, 4)),
+    properties   TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(properties)),
     status       TEXT NOT NULL DEFAULT 'unknown'
                  CHECK (status IN ('active', 'planned', 'discontinued', 'unknown')),
     valid_from   TEXT,
@@ -88,8 +86,8 @@ CREATE TABLE product_variants (
     product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
     variant_key TEXT NOT NULL,
     label       TEXT,
-    properties  BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(properties, 4)),
-    constraints BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(constraints, 4)),
+    properties  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(properties)),
+    constraints TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(constraints)),
     status      TEXT NOT NULL DEFAULT 'unknown'
                 CHECK (status IN ('active', 'planned', 'discontinued', 'unknown')),
     valid_from  TEXT,
@@ -109,7 +107,7 @@ CREATE TABLE product_codes (
     code_type   TEXT NOT NULL DEFAULT 'new'
                 CHECK (code_type IN ('new', 'old', 'erp', 'model', 'alias', 'legacy')),
     is_primary  INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
-    conditions  BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(conditions, 4)),
+    conditions  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(conditions)),
     notes       TEXT
 ) STRICT;
 
@@ -124,7 +122,7 @@ CREATE TABLE colors (
     name        TEXT NOT NULL,
     color_class TEXT,
     material    TEXT,
-    properties  BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(properties, 4)),
+    properties  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(properties)),
     status      TEXT NOT NULL DEFAULT 'unknown'
                 CHECK (status IN ('active', 'planned', 'discontinued', 'unknown')),
     valid_from  TEXT,
@@ -162,9 +160,9 @@ CREATE TABLE pricing_rules (
                        'service', 'note'
                    )),
     pricing_mode   TEXT,
-    scope          BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(scope, 4)),
-    conditions     BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(conditions, 4)),
-    data           BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(data, 4)),
+    scope          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(scope)),
+    conditions     TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(conditions)),
+    data           TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(data)),
     description    TEXT,
     priority       INTEGER NOT NULL DEFAULT 100,
     valid_from     TEXT,
@@ -190,7 +188,7 @@ CREATE TABLE prices (
                         CHECK (measurement_basis IN ('fixed', 'length', 'actual_area', 'projected_area', 'expanded_area', 'custom')),
     pricing_mode        TEXT
                         CHECK (pricing_mode IN ('unit_cabinet', 'linear_meter', 'component', 'bundle', 'service', 'other')),
-    conditions          BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(conditions, 4)),
+    conditions          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(conditions)),
     derivation_rule_id  INTEGER REFERENCES pricing_rules(id) ON DELETE SET NULL,
     notes               TEXT,
     valid_from          TEXT,
@@ -217,8 +215,8 @@ CREATE TABLE product_relations (
                             'compatible_with', 'incompatible_with', 'upgrade',
                             'replaced_by'
                         )),
-    quantity            BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(quantity, 4)),
-    conditions          BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(conditions, 4)),
+    quantity            TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(quantity)),
+    conditions          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(conditions)),
     notes               TEXT,
     CHECK (child_product_id IS NOT NULL OR child_variant_id IS NOT NULL OR child_label IS NOT NULL)
 ) STRICT;
@@ -239,7 +237,7 @@ CREATE TABLE documents (
                    )),
     title          TEXT NOT NULL,
     content        TEXT,
-    data           BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(data, 4)),
+    data           TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(data)),
     sort_order     INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) STRICT;
@@ -270,7 +268,7 @@ CREATE TABLE image_links (
                  )),
     sort_order   INTEGER NOT NULL DEFAULT 0,
     is_primary   INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
-    crop         BLOB NOT NULL DEFAULT (jsonb('{}')) CHECK (json_valid(crop, 4)),
+    crop         TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(crop)),
     alt_text     TEXT,
     UNIQUE (image_id, owner_type, owner_id, role, sort_order)
 ) STRICT;
